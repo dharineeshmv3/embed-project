@@ -1,0 +1,280 @@
+/*
+ * STM32F401RE (Nucleo) - AC meter, register level (CMSIS header only)
+ *   PA0 = ACS712 (current)   PA1 = ZMPT101B (voltage)
+ *   TIM2 TRGO @10 kHz -> ADC1 scans IN0,IN1 -> DMA2 Stream0 (circular)
+ *   USART2 PA2 @115200 (ST-Link virtual COM)
+ *
+ * PLOT_MODE 1 : sends one frame per update for ac_dashboard.py
+ *                 M,vi,vrms,ii,irms,p,s,pf,clipI,clipV
+ *                 I,<one mains cycle of current, mA, comma separated>
+ *                 V,<one mains cycle of voltage, 0.1 V units, comma separated>
+ * PLOT_MODE 0 : human-readable text line (Serial Monitor)
+ *
+ * At power-up the noise floor is measured for ~1.2 s:
+ * KEEP MAINS OFF the ZMPT101B and NO LOAD on the ACS712 until
+ * "Noise calibrated." appears.
+ */
+#include "stm32f401xe.h"
+#include <stdio.h>
+#include <stdint.h>
+
+/* ================= USER CALIBRATION ================= */
+#define VREF          3.3f     /* ADC reference (VDDA)                       */
+#define ACS_SENS      0.185f   /* V/A: 5A=0.185, 20A=0.100, 30A=0.066        */
+#define ZMPT_GAIN     338.0f   /* mains-volts per ADC-volt. Re-calibrate after
+                                  turning the trim pot down (see notes)      */
+#define WIN           1000     /* sample pairs per window (100 ms @ 10 kHz)  */
+#define MAINS_CYCLES  5        /* cycles in a window: 5 @50 Hz, 6 @60 Hz     */
+#define PRINT_EVERY   1        /* send a frame every N windows               */
+
+#define SKIP_WINDOWS  2
+#define CAL_WINDOWS   10
+#define V_DEADBAND    2.0f     /* Vrms below this (V) is shown as 0          */
+#define I_DEADBAND    0.03f    /* Irms below this (A) is shown as 0          */
+#define CLIP_HI       4000     /* raw counts considered "clipping"           */
+#define CLIP_LO       95
+#define PLOT_MODE     1
+/* ==================================================== */
+
+#define CYC (WIN / MAINS_CYCLES)   /* samples in one mains cycle */
+
+static volatile uint16_t adc_buf[2][WIN][2];   /* [half][sample][0=I,1=V] */
+static volatile int8_t   ready_half = -1;
+
+static float noise_v2 = 0.0f, noise_i2 = 0.0f;
+static int   win_cnt  = 0;
+
+/* one-cycle copy, so slow UART sending never reads data DMA is overwriting */
+static int32_t fr_i[CYC];      /* mA      */
+static int32_t fr_v[CYC];      /* 0.1 V   */
+
+/* ---------------- UART (USART2, PA2 TX) ---------------- */
+static void uart_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+
+    GPIOA->MODER  &= ~(3U << (2 * 2));
+    GPIOA->MODER  |=  (2U << (2 * 2));          /* PA2 alternate function */
+    GPIOA->AFR[0] &= ~(0xFU << (2 * 4));
+    GPIOA->AFR[0] |=  (7U   << (2 * 4));        /* AF7 = USART2           */
+
+    USART2->BRR = (8U << 4) | 11U;              /* 16 MHz / 115200        */
+    USART2->CR1 = USART_CR1_UE | USART_CR1_TE;
+}
+
+static void uart_puts(const char *s)            /* no wait for last byte  */
+{
+    while (*s) {
+        while (!(USART2->SR & USART_SR_TXE));
+        USART2->DR = (uint8_t)*s++;
+    }
+}
+
+static void uart_flush(void)
+{
+    while (!(USART2->SR & USART_SR_TC));
+}
+
+/* float -> "-12.345" without printf-float support */
+static int fx(char *b, float x)
+{
+    long m = (long)(x * 1000.0f + (x < 0 ? -0.5f : 0.5f));
+    const char *sgn = "";
+    if (m < 0) { sgn = "-"; m = -m; }
+    return sprintf(b, "%s%ld.%03ld", sgn, m / 1000, m % 1000);
+}
+
+/* ---------------- GPIO / TIM2 / DMA / ADC ---------------- */
+static void gpio_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    GPIOA->MODER |= (3U << (0 * 2)) | (3U << (1 * 2));   /* PA0, PA1 analog */
+}
+
+static void tim2_init(void)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+    TIM2->PSC = 16 - 1;                    /* 16 MHz / 16 = 1 MHz          */
+    TIM2->ARR = 100 - 1;                   /* 1 MHz / 100 = 10 kHz         */
+    TIM2->CR2 = (2U << TIM_CR2_MMS_Pos);   /* TRGO = update event          */
+    TIM2->EGR = TIM_EGR_UG;
+}
+
+static void dma_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;
+
+    DMA2_Stream0->CR &= ~DMA_SxCR_EN;
+    while (DMA2_Stream0->CR & DMA_SxCR_EN);
+
+    DMA2->LIFCR = 0x3FU;
+
+    DMA2_Stream0->PAR  = (uint32_t)&ADC1->DR;
+    DMA2_Stream0->M0AR = (uint32_t)adc_buf;
+    DMA2_Stream0->NDTR = 2 * WIN * 2;
+    DMA2_Stream0->CR   = (0U << DMA_SxCR_CHSEL_Pos)
+                       | (1U << DMA_SxCR_PSIZE_Pos)
+                       | (1U << DMA_SxCR_MSIZE_Pos)
+                       | DMA_SxCR_MINC
+                       | DMA_SxCR_CIRC
+                       | DMA_SxCR_HTIE
+                       | DMA_SxCR_TCIE;
+    DMA2_Stream0->CR |= DMA_SxCR_EN;
+
+    NVIC_SetPriority(DMA2_Stream0_IRQn, 1);
+    NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+}
+
+static void adc_init(void)
+{
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+
+    ADC->CCR = 0;                               /* ADCCLK = 8 MHz          */
+
+    ADC1->CR1   = ADC_CR1_SCAN;
+    ADC1->SMPR2 = (6U << 0) | (6U << 3);        /* 144 cycles, ch0 & ch1   */
+    ADC1->SQR1  = (1U << ADC_SQR1_L_Pos);       /* 2 conversions           */
+    ADC1->SQR3  = (0U << ADC_SQR3_SQ1_Pos)      /* IN0 = PA0 current       */
+                | (1U << ADC_SQR3_SQ2_Pos);     /* IN1 = PA1 voltage       */
+
+    ADC1->CR2 = ADC_CR2_DMA | ADC_CR2_DDS
+              | (6U << ADC_CR2_EXTSEL_Pos)      /* TIM2 TRGO               */
+              | (1U << ADC_CR2_EXTEN_Pos)       /* rising edge             */
+              | ADC_CR2_ADON;
+}
+
+void DMA2_Stream0_IRQHandler(void)
+{
+    uint32_t isr = DMA2->LISR;
+    if (isr & DMA_LISR_HTIF0) { DMA2->LIFCR = DMA_LIFCR_CHTIF0; ready_half = 0; }
+    if (isr & DMA_LISR_TCIF0) { DMA2->LIFCR = DMA_LIFCR_CTCIF0; ready_half = 1; }
+}
+
+/* ---------------- Frame output ---------------- */
+static void send_array(const char *tag, const int32_t *a)
+{
+    char b[16];
+    uart_puts(tag);
+    for (int n = 0; n < CYC; n++) {
+        sprintf(b, "%ld,", (long)a[n]);
+        uart_puts(b);
+    }
+    uart_puts("\r\n");
+}
+
+/* ---------------- Processing (called for every window) ---------------- */
+/* returns 1 if a (slow) frame was transmitted */
+static int process_window(int half)
+{
+    volatile uint16_t (*d)[2] = adc_buf[half];
+    const float k = VREF / 4095.0f;
+
+    /* pass 1: DC offsets + clipping count */
+    float sum_i = 0, sum_v = 0;
+    int clip_i = 0, clip_v = 0;
+    for (int n = 0; n < WIN; n++) {
+        uint16_t ci = d[n][0], cv = d[n][1];
+        sum_i += ci;
+        sum_v += cv;
+        if (ci > CLIP_HI || ci < CLIP_LO) clip_i++;
+        if (cv > CLIP_HI || cv < CLIP_LO) clip_v++;
+    }
+    float off_i = sum_i / WIN;
+    float off_v = sum_v / WIN;
+
+    /* pass 2: AC components */
+    float sq_i = 0, sq_v = 0, sum_p = 0;
+    for (int n = 0; n < WIN; n++) {
+        float i = ((float)d[n][0] - off_i) * k / ACS_SENS;
+        float v = ((float)d[n][1] - off_v) * k * ZMPT_GAIN;
+        sq_i  += i * i;
+        sq_v  += v * v;
+        sum_p += i * v;
+    }
+    float ir2 = sq_i / WIN;
+    float vr2 = sq_v / WIN;
+
+    /* start-up: skip, then measure noise floor */
+    win_cnt++;
+    if (win_cnt <= SKIP_WINDOWS) return 0;
+    if (win_cnt <= SKIP_WINDOWS + CAL_WINDOWS) {
+        noise_v2 += vr2 / CAL_WINDOWS;
+        noise_i2 += ir2 / CAL_WINDOWS;
+        if (win_cnt == SKIP_WINDOWS + CAL_WINDOWS)
+            uart_puts("Noise calibrated. Mains may be connected now.\r\n");
+        return 0;
+    }
+
+    static int pc = 0;
+    if (++pc < PRINT_EVERY) return 0;
+    pc = 0;
+
+    vr2 -= noise_v2;  if (vr2 < 0) vr2 = 0;
+    ir2 -= noise_i2;  if (ir2 < 0) ir2 = 0;
+    float vrms = __builtin_sqrtf(vr2);
+    float irms = __builtin_sqrtf(ir2);
+    if (vrms < V_DEADBAND) vrms = 0;
+    if (irms < I_DEADBAND) irms = 0;
+
+    float p  = (vrms > 0 && irms > 0) ? sum_p / WIN : 0.0f;
+    float s  = vrms * irms;
+    float pf = (s > 0.001f) ? p / s : 0.0f;
+    if (pf >  1.0f) pf =  1.0f;
+    if (pf < -1.0f) pf = -1.0f;
+
+    /* copy one cycle NOW (before slow UART), scaled to integers */
+    for (int n = 0; n < CYC; n++) {
+        float i = ((float)d[n][0] - off_i) * k / ACS_SENS;
+        float v = ((float)d[n][1] - off_v) * k * ZMPT_GAIN;
+        fr_i[n] = (irms > 0) ? (int32_t)(i * 1000.0f) : 0;
+        fr_v[n] = (vrms > 0) ? (int32_t)(v * 10.0f)   : 0;
+    }
+    float i_inst = fr_i[CYC - 1] / 1000.0f;
+    float v_inst = fr_v[CYC - 1] / 10.0f;
+
+    char s1[16], s2[16], s3[16], s4[16], s5[16], s6[16], s7[16], line[160];
+    fx(s1, v_inst); fx(s2, vrms); fx(s3, i_inst); fx(s4, irms);
+    fx(s5, p);      fx(s6, s);    fx(s7, pf);
+
+#if PLOT_MODE
+    sprintf(line, "M,%s,%s,%s,%s,%s,%s,%s,%d,%d\r\n",
+            s1, s2, s3, s4, s5, s6, s7, clip_i, clip_v);
+    uart_puts(line);
+    send_array("I,", fr_i);
+    send_array("V,", fr_v);
+#else
+    sprintf(line, "Vi=%sV Vrms=%sV | Ii=%sA Irms=%sA | P=%sW S=%sVA PF=%s%s\r\n",
+            s1, s2, s3, s4, s5, s6, s7,
+            (clip_i || clip_v) ? "  [CLIPPING]" : "");
+    uart_puts(line);
+#endif
+    uart_flush();
+    return 1;
+}
+
+int main(void)
+{
+    SCB->CPACR |= (0xFU << 20);                 /* enable FPU */
+    __DSB(); __ISB();
+
+    gpio_init();
+    uart_init();
+    dma_init();
+    adc_init();
+    tim2_init();
+
+    uart_puts("\r\nAC meter start (10 kHz, ADC1 + DMA)\r\n");
+    uart_puts("Calibrating noise floor - keep mains OFF and no load...\r\n");
+    uart_flush();
+    TIM2->CR1 |= TIM_CR1_CEN;
+
+    while (1) {
+        if (ready_half >= 0) {
+            int h = ready_half;
+            ready_half = -1;
+            /* after a slow frame the flagged half is stale: wait for a new one */
+            if (process_window(h)) ready_half = -1;
+        }
+    }
+}
