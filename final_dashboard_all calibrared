@@ -1,0 +1,450 @@
+/*
+ * STM32F401RE (Nucleo) - AC meter, TEXT / DEBUG + DASHBOARD output
+ *   PA0 = ACS712 (current)   PA1 = ZMPT101B (voltage)
+ *   TIM2 TRGO @10 kHz -> ADC1 scans IN0,IN1 -> DMA2 Stream0 (circular)
+ *   USART2 PA2 @115200 (ST-Link virtual COM) - open in Serial Monitor
+ *
+ * DASH_OUTPUT = 0 : human-readable text (original behaviour)
+ * DASH_OUTPUT = 1 : structured CSV lines for Python dashboard
+ *
+ * Dashboard protocol (lines starting with '$'):
+ *   $W,V,v0,v1,...,v(CYC-1)   one-cycle voltage waveform (V)
+ *   $W,I,i0,i1,...,i(CYC-1)   one-cycle current waveform (A)
+ *   $M,Vrms,Irms,P,S,Q,PF,THDv,THDi,crest,Vpk,Ipk
+ *   $H,I,h2%,h3%,...,h15%     current harmonic amplitudes (% of fundamental)
+ *   $H,V,h2%,h3%,...,h15%     voltage harmonic amplitudes
+ *   $E                        end-of-frame marker
+ *
+ * At power-up the noise floor is measured for ~1.2 s:
+ * KEEP MAINS OFF the ZMPT101B and NO LOAD on the ACS712 until
+ * "Noise calibrated." appears.
+ */
+#include "stm32f401xe.h"
+#include <stdio.h>
+#include <stdint.h>
+
+/* ================= USER CALIBRATION ================= */
+#define VREF          3.3f     /* ADC reference (VDDA)                       */
+#define ACS_SENS      0.185f   /* V/A: 5A=0.185, 20A=0.100, 30A=0.066        */
+#define ZMPT_GAIN     1014.0f   /* mains-volts per ADC-volt (recalibrate)     */
+#define WIN           1000     /* sample pairs per window (100 ms @ 10 kHz)  */
+#define MAINS_CYCLES  5        /* cycles in a window: 5 @50 Hz, 6 @60 Hz     */
+#define PRINT_EVERY   5        /* print every N windows (0.5 s)              */
+#define PRINT_HARM    1        /* 1 = also print harmonics H2..H15 (%)       */
+#define DASH_OUTPUT   1        /* 1 = structured output for Python dashboard  */
+
+#define SKIP_WINDOWS  2
+#define CAL_WINDOWS   10
+#define V_DEADBAND    5.0f     /* Vrms below this (V) is shown as 0          */
+#define I_DEADBAND    0.03f    /* Irms below this (A) is shown as 0          */
+#define CLIP_HI       4000     /* raw counts considered "clipping"           */
+#define CLIP_LO       95
+#define HARM_N        25       /* harmonics used for THD                     */
+/* ==================================================== */
+
+#define CYC (WIN / MAINS_CYCLES)   /* samples in one mains cycle */
+
+static volatile uint16_t adc_buf[2][WIN][2];   /* [half][sample][0=I,1=V] */
+static volatile int8_t   ready_half = -1;
+
+static float noise_v2 = 0.0f, noise_i2 = 0.0f;
+static int   win_cnt  = 0;
+
+/* one-cycle copies (scaled to A and V) and sine/cosine tables */
+static float cur[CYC], vol[CYC];
+static float sin_tab[CYC], cos_tab[CYC];
+
+/* ---------------- UART (USART2, PA2 TX) ---------------- */
+static void uart_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+
+    GPIOA->MODER  &= ~(3U << (2 * 2));
+    GPIOA->MODER  |=  (2U << (2 * 2));          /* PA2 alternate function */
+    GPIOA->AFR[0] &= ~(0xFU << (2 * 4));
+    GPIOA->AFR[0] |=  (7U   << (2 * 4));        /* AF7 = USART2           */
+
+    USART2->BRR = (8U << 4) | 11U;              /* 16 MHz / 115200        */
+    USART2->CR1 = USART_CR1_UE | USART_CR1_TE;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) {
+        while (!(USART2->SR & USART_SR_TXE));
+        USART2->DR = (uint8_t)*s++;
+    }
+}
+
+/* float -> "-12.345" without printf-float support */
+static int fx(char *b, float x)
+{
+    long m = (long)(x * 1000.0f + (x < 0 ? -0.5f : 0.5f));
+    const char *sgn = "";
+    if (m < 0) { sgn = "-"; m = -m; }
+    return sprintf(b, "%s%ld.%03ld", sgn, m / 1000, m % 1000);
+}
+
+/* print  <pre><float><post> */
+static void put_f(const char *pre, float x, const char *post)
+{
+    char b[24];
+    fx(b, x);
+    uart_puts(pre);
+    uart_puts(b);
+    uart_puts(post);
+}
+
+/* ---------------- Dashboard helpers ---------------- */
+#if DASH_OUTPUT
+/* Send one-cycle waveform:  $W,<tag>,v0,v1,...,v(CYC-1)\r\n */
+static void dash_send_wave(const char *tag, const float *arr, int len)
+{
+    char b[16];
+    uart_puts("$W,");
+    uart_puts(tag);
+    for (int n = 0; n < len; n++) {
+        uart_puts(",");
+        fx(b, arr[n]);
+        uart_puts(b);
+    }
+    uart_puts("\r\n");
+}
+
+/* Send harmonic percentages:  $H,<tag>,h2,h3,...,h15\r\n */
+static void dash_send_harm(const char *tag, const float *amp)
+{
+    char b[16];
+    uart_puts("$H,");
+    uart_puts(tag);
+    for (int h = 2; h <= 15; h++) {
+        float pct = (amp[1] > 1e-6f) ? 100.0f * amp[h] / amp[1] : 0.0f;
+        uart_puts(",");
+        fx(b, pct);
+        uart_puts(b);
+    }
+    uart_puts("\r\n");
+}
+#endif /* DASH_OUTPUT */
+
+/* ---------------- GPIO / TIM2 / DMA / ADC ---------------- */
+static void gpio_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    GPIOA->MODER |= (3U << (0 * 2)) | (3U << (1 * 2));   /* PA0, PA1 analog */
+}
+
+static void tim2_init(void)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+    TIM2->PSC = 16 - 1;                    /* 16 MHz / 16 = 1 MHz          */
+    TIM2->ARR = 100 - 1;                   /* 1 MHz / 100 = 10 kHz         */
+    TIM2->CR2 = (2U << TIM_CR2_MMS_Pos);   /* TRGO = update event          */
+    TIM2->EGR = TIM_EGR_UG;
+}
+
+static void dma_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;
+
+    DMA2_Stream0->CR &= ~DMA_SxCR_EN;
+    while (DMA2_Stream0->CR & DMA_SxCR_EN);
+
+    DMA2->LIFCR = 0x3FU;
+
+    DMA2_Stream0->PAR  = (uint32_t)&ADC1->DR;
+    DMA2_Stream0->M0AR = (uint32_t)adc_buf;
+    DMA2_Stream0->NDTR = 2 * WIN * 2;
+    DMA2_Stream0->CR   = (0U << DMA_SxCR_CHSEL_Pos)
+                       | (1U << DMA_SxCR_PSIZE_Pos)
+                       | (1U << DMA_SxCR_MSIZE_Pos)
+                       | DMA_SxCR_MINC
+                       | DMA_SxCR_CIRC
+                       | DMA_SxCR_HTIE
+                       | DMA_SxCR_TCIE;
+    DMA2_Stream0->CR |= DMA_SxCR_EN;
+
+    NVIC_SetPriority(DMA2_Stream0_IRQn, 1);
+    NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+}
+
+static void adc_init(void)
+{
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+
+    ADC->CCR = 0;                               /* ADCCLK = 8 MHz          */
+
+    ADC1->CR1   = ADC_CR1_SCAN;
+    ADC1->SMPR2 = (6U << 0) | (6U << 3);        /* 144 cycles, ch0 & ch1   */
+    ADC1->SQR1  = (1U << ADC_SQR1_L_Pos);       /* 2 conversions           */
+    ADC1->SQR3  = (0U << ADC_SQR3_SQ1_Pos)      /* IN0 = PA0 current       */
+                | (1U << ADC_SQR3_SQ2_Pos);     /* IN1 = PA1 voltage       */
+
+    ADC1->CR2 = ADC_CR2_DMA | ADC_CR2_DDS
+              | (6U << ADC_CR2_EXTSEL_Pos)      /* TIM2 TRGO               */
+              | (1U << ADC_CR2_EXTEN_Pos)       /* rising edge             */
+              | ADC_CR2_ADON;
+}
+
+void DMA2_Stream0_IRQHandler(void)
+{
+    uint32_t isr = DMA2->LISR;
+    if (isr & DMA_LISR_HTIF0) { DMA2->LIFCR = DMA_LIFCR_CHTIF0; ready_half = 0; }
+    if (isr & DMA_LISR_TCIF0) { DMA2->LIFCR = DMA_LIFCR_CTCIF0; ready_half = 1; }
+}
+
+/* ---------------- Harmonics (DFT over exactly one mains cycle) ---------------- */
+static void harm_init(void)
+{
+    /* sin/cos tables by rotation, no libm needed */
+    float th = 6.28318530718f / (float)CYC, t2 = th * th;
+    float c = 1.0f - t2 / 2.0f + t2 * t2 / 24.0f - t2 * t2 * t2 / 720.0f;
+    float s = th * (1.0f - t2 / 6.0f + t2 * t2 / 120.0f - t2 * t2 * t2 / 5040.0f);
+    float cn = 1.0f, sn = 0.0f;
+    for (int n = 0; n < CYC; n++) {
+        cos_tab[n] = cn;
+        sin_tab[n] = sn;
+        float cn2 = cn * c - sn * s;
+        float sn2 = sn * c + cn * s;
+        cn = cn2;
+        sn = sn2;
+    }
+}
+
+/* amp[h] = peak amplitude of harmonic h (h = 1..HARM_N) */
+static void harmonics(const float *x, float *amp)
+{
+    for (int h = 1; h <= HARM_N; h++) {
+        float a = 0.0f, b = 0.0f;
+        for (int n = 0; n < CYC; n++) {
+            int idx = (h * n) % CYC;
+            a += x[n] * cos_tab[idx];
+            b += x[n] * sin_tab[idx];
+        }
+        a *= 2.0f / CYC;
+        b *= 2.0f / CYC;
+        amp[h] = __builtin_sqrtf(a * a + b * b);
+    }
+}
+
+static float thd_pct(const float *amp)
+{
+    if (amp[1] < 1e-6f) return 0.0f;
+    float s = 0.0f;
+    for (int h = 2; h <= HARM_N; h++) s += amp[h] * amp[h];
+    return 100.0f * __builtin_sqrtf(s) / amp[1];
+}
+
+#if PRINT_HARM && !DASH_OUTPUT
+static void print_harm(const char *tag, const float *amp)
+{
+    char line[200];
+    int n = sprintf(line, "  %s harm %%:", tag);
+    for (int h = 2; h <= 15; h++)
+        n += sprintf(line + n, " H%d=%d", h, (int)(100.0f * amp[h] / amp[1] + 0.5f));
+    sprintf(line + n, "\r\n");
+    uart_puts(line);
+}
+#endif
+
+static float fabs_f(float x) { return x < 0 ? -x : x; }
+
+/* ---------------- Processing (called for every window) ---------------- */
+static int process_window(int half)
+{
+    volatile uint16_t (*d)[2] = adc_buf[half];
+    const float k = VREF / 4095.0f;
+
+    /* pass 1: DC offsets, raw min/max, clipping */
+    float sum_i = 0, sum_v = 0;
+    uint16_t mn_i = 4095, mx_i = 0, mn_v = 4095, mx_v = 0;
+    int clip_i = 0, clip_v = 0;
+    for (int n = 0; n < WIN; n++) {
+        uint16_t ci = d[n][0], cv = d[n][1];
+        sum_i += ci;
+        sum_v += cv;
+        if (ci < mn_i) mn_i = ci;
+        if (ci > mx_i) mx_i = ci;
+        if (cv < mn_v) mn_v = cv;
+        if (cv > mx_v) mx_v = cv;
+        if (ci > CLIP_HI || ci < CLIP_LO) clip_i++;
+        if (cv > CLIP_HI || cv < CLIP_LO) clip_v++;
+    }
+    float off_i = sum_i / WIN;
+    float off_v = sum_v / WIN;
+
+    /* pass 2: AC components */
+    float sq_i = 0, sq_v = 0, sum_p = 0;
+    for (int n = 0; n < WIN; n++) {
+        float i = ((float)d[n][0] - off_i) * k / ACS_SENS;
+        float v = ((float)d[n][1] - off_v) * k * ZMPT_GAIN;
+        sq_i  += i * i;
+        sq_v  += v * v;
+        sum_p += i * v;
+    }
+    float ir2 = sq_i / WIN;
+    float vr2 = sq_v / WIN;
+
+    /* start-up: skip, then measure the noise floor */
+    win_cnt++;
+    if (win_cnt <= SKIP_WINDOWS) return 0;
+    if (win_cnt <= SKIP_WINDOWS + CAL_WINDOWS) {
+        noise_v2 += vr2 / CAL_WINDOWS;
+        noise_i2 += ir2 / CAL_WINDOWS;
+        if (win_cnt == SKIP_WINDOWS + CAL_WINDOWS) {
+            put_f("Measured noise: Vrms=", __builtin_sqrtf(noise_v2), " V");
+            put_f("  Irms=", __builtin_sqrtf(noise_i2), " A\r\n");
+            if (noise_v2 > 25.0f) {
+                noise_v2 = 0.0f;
+                uart_puts("WARNING: voltage present during calibration - ignored.\r\n");
+            }
+            if (noise_i2 > 0.01f) {
+                noise_i2 = 0.0f;
+                uart_puts("WARNING: current present during calibration - ignored.\r\n");
+            }
+            uart_puts("Noise calibrated. Mains may be connected now.\r\n\r\n");
+        }
+        return 0;
+    }
+
+    static int pc = 0;
+    if (++pc < PRINT_EVERY) return 0;
+    pc = 0;
+
+    vr2 -= noise_v2;  if (vr2 < 0) vr2 = 0;
+    ir2 -= noise_i2;  if (ir2 < 0) ir2 = 0;
+    float vrms = __builtin_sqrtf(vr2);
+    float irms = __builtin_sqrtf(ir2);
+    if (vrms < V_DEADBAND) vrms = 0;
+    if (irms < I_DEADBAND) irms = 0;
+
+    float p  = (vrms > 0 && irms > 0) ? sum_p / WIN : 0.0f;
+    float s  = vrms * irms;
+    float q  = 0.0f;
+    if (s * s > p * p) q = __builtin_sqrtf(s * s - p * p);
+    float pf = (s > 0.001f) ? p / s : 0.0f;
+    if (pf >  1.0f) pf =  1.0f;
+    if (pf < -1.0f) pf = -1.0f;
+
+    /* copy one cycle NOW, scaled to A and V (0 if in dead-band) */
+    float ipk = 0, vpk = 0;
+    for (int n = 0; n < CYC; n++) {
+        cur[n] = (irms > 0) ? ((float)d[n][0] - off_i) * k / ACS_SENS     : 0.0f;
+        vol[n] = (vrms > 0) ? ((float)d[n][1] - off_v) * k * ZMPT_GAIN    : 0.0f;
+        if (fabs_f(cur[n]) > ipk) ipk = fabs_f(cur[n]);
+        if (fabs_f(vol[n]) > vpk) vpk = fabs_f(vol[n]);
+    }
+
+    float amp_i[HARM_N + 1], amp_v[HARM_N + 1];
+    float thd_i = 0.0f, thd_v = 0.0f;
+    if (irms > 0) { harmonics(cur, amp_i); thd_i = thd_pct(amp_i); }
+    if (vrms > 0) { harmonics(vol, amp_v); thd_v = thd_pct(amp_v); }
+    float crest = (irms > 0) ? ipk / irms : 0.0f;
+
+    /* ==================== OUTPUT ==================== */
+#if DASH_OUTPUT
+    /* ---- Structured CSV for Python dashboard ---- */
+
+    /* Waveforms: one cycle of voltage & current */
+    dash_send_wave("V", vol, CYC);
+    dash_send_wave("I", cur, CYC);
+
+    /* Metrics line */
+    {
+        char mb[200];
+        int n = sprintf(mb, "$M,");
+        n += fx(mb + n, vrms);  mb[n++] = ',';
+        n += fx(mb + n, irms);  mb[n++] = ',';
+        n += fx(mb + n, p);     mb[n++] = ',';
+        n += fx(mb + n, s);     mb[n++] = ',';
+        n += fx(mb + n, q);     mb[n++] = ',';
+        n += fx(mb + n, pf);    mb[n++] = ',';
+        n += fx(mb + n, thd_v); mb[n++] = ',';
+        n += fx(mb + n, thd_i); mb[n++] = ',';
+        n += fx(mb + n, crest); mb[n++] = ',';
+        n += fx(mb + n, vpk);   mb[n++] = ',';
+        n += fx(mb + n, ipk);
+        mb[n++] = '\r'; mb[n++] = '\n'; mb[n] = '\0';
+        uart_puts(mb);
+    }
+
+    /* Harmonics (% of fundamental) */
+    if (irms > 0) dash_send_harm("I", amp_i);
+    if (vrms > 0) dash_send_harm("V", amp_v);
+
+    /* RAW diagnostics (always useful for debugging) */
+    {
+        char b[160];
+        sprintf(b, "$R,%d,%u,%u,%d,%d,%u,%u,%d\r\n",
+                (int)off_v, mn_v, mx_v, clip_v,
+                (int)off_i, mn_i, mx_i, clip_i);
+        uart_puts(b);
+    }
+
+    uart_puts("$E\r\n");
+
+#else
+    /* ---- Human-readable text (original) ---- */
+    put_f("V  : inst=", vol[CYC - 1], " V");
+    put_f("  rms=", vrms, " V");
+    put_f("  peak=", vpk, " V");
+    put_f("  THD=", thd_v, " %\r\n");
+
+    put_f("I  : inst=", cur[CYC - 1], " A");
+    put_f("  rms=", irms, " A");
+    put_f("  peak=", ipk, " A");
+    put_f("  THD=", thd_i, " %");
+    put_f("  crest=", crest, "\r\n");
+
+    put_f("PWR: P=", p, " W");
+    put_f("  S=", s, " VA");
+    put_f("  Q=", q, " var");
+    put_f("  PF=", pf, "\r\n");
+
+    {
+        char b[160];
+        sprintf(b, "RAW: V mean=%d min=%u max=%u clip=%d | I mean=%d min=%u max=%u clip=%d%s\r\n",
+                (int)off_v, mn_v, mx_v, clip_v, (int)off_i, mn_i, mx_i, clip_i,
+                (clip_v > 5 || clip_i > 5) ? "  <-- CLIPPING" : "");
+        uart_puts(b);
+    }
+
+#if PRINT_HARM
+    if (irms > 0 && amp_i[1] > 1e-6f) print_harm("I", amp_i);
+    if (vrms > 0 && amp_v[1] > 1e-6f) print_harm("V", amp_v);
+#endif
+    uart_puts("\r\n");
+#endif /* DASH_OUTPUT */
+
+    while (!(USART2->SR & USART_SR_TC));
+    return 1;
+}
+
+int main(void)
+{
+    SCB->CPACR |= (0xFU << 20);                 /* enable FPU */
+    __DSB(); __ISB();
+
+    gpio_init();
+    uart_init();
+    harm_init();
+    dma_init();
+    adc_init();
+    tim2_init();
+
+    uart_puts("\r\nAC meter start (10 kHz, ADC1 + DMA)\r\n");
+#if DASH_OUTPUT
+    uart_puts("DASHBOARD mode - structured output enabled\r\n");
+#endif
+    uart_puts("Calibrating noise floor - keep mains OFF and no load...\r\n");
+    TIM2->CR1 |= TIM_CR1_CEN;
+
+    while (1) {
+        if (ready_half >= 0) {
+            int h = ready_half;
+            ready_half = -1;
+            if (process_window(h)) ready_half = -1;
+        }
+    }
+}
