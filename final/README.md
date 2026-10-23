@@ -23,3 +23,11 @@ python dashboard.py --port COM6
 | `AHF_SENSE_GRID` | `0` if sensor I measures the load current before the injection point, `1` if it measures the already-compensated grid current. |
 | `AHF_INJ_RATIO` | Coupling-transformer ratio; `1` for direct injection. |
 | `AHF_VDC`, `AHF_L_H`, `AHF_R_OHM` | Only a starting guess; the firmware measures the real values. |
+| `RELAY_SSR_MASK` | Bit set = that pin drives an active-HIGH SSR (default `0x4`: PB2). Clear = 5 V active-LOW relay module. |
+| `CAP_RECLOSE_MS` | 10 s minimum OFF time before a capacitor re-closes. |
+
+## Capacitor bank safety
+
+* Fit a **bleeder resistor across every capacitor**: 2.5 µF → 820 kΩ, 10 µF → 220 kΩ, 20 µF → 100 kΩ (1 W, ≥ 400 V rated). Without it the capacitor stays charged for minutes and the relay closes onto up to 650 V, which welds its contacts.
+* Prefer **zero-cross SSRs** for switching capacitors; mechanical relay modules (10 A resistive rating) are not rated for capacitor inrush.
+* Use AC film capacitors (motor-run / PFC type) rated **≥ 400 VAC**, never electrolytics.
