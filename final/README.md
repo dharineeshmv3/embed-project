@@ -25,7 +25,9 @@ python dashboard.py --port COM6
 | `AHF_INJ_RATIO` | Coupling-transformer ratio; `1` for direct injection. |
 | `AHF_VDC`, `AHF_L_H`, `AHF_R_OHM` | Only a starting guess; the firmware measures the real values. |
 | `RELAY_SSR_MASK` | Bit set = that pin drives an active-HIGH SSR (default `0x4`: PB2). Clear = 5 V active-LOW relay module. |
-| `RELAY_MIN_ON_MS`, `CAP_RECLOSE_MS` | 10 s minimum ON and OFF time for each capacitor. |
+| `PF_TARGET` | 0.99: AUTO switches a step in whenever it brings PF closer. |
+| `RELAY_MIN_ON_MS`, `CAP_RECLOSE_MS` | 5 s minimum ON and OFF time for each capacitor. |
+| `A_LPF_HZ`, `A_DEADBAND` | Butterworth low-pass and noise floor for the AHF current sensor (ACS712 #2). |
 | `RELAY_SYNC`, `RELAY_T_OP_MS`, `RELAY_T_REL_MS` | Relay modules open just before and close at the voltage peak, so a capacitor without a bleeder resistor is reconnected with ~0 V across the contacts. |
 
 ## Capacitor bank safety
