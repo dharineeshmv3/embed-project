@@ -1,0 +1,22 @@
+# Libraries needed to run dashboard.py (Python 3.9 or newer, 64-bit)
+#
+# Install all of them with ONE command (run in PowerShell / Command Prompt):
+#
+#     python -m pip install -r requirements.txt
+#
+# or, without this file:
+#
+#     python -m pip install numpy pyserial pyqtgraph PySide6
+#
+# Use "python -m pip" (not just "pip") so the libraries go into the same
+# Python that runs the dashboard.
+
+numpy        # waveform and harmonic maths
+pyserial     # reads the STM32 over the ST-LINK COM port
+pyqtgraph    # fast plots
+PySide6      # window, tabs and buttons (Qt)
+
+# Run:
+#     python dashboard.py --port COM6     (your board's COM port)
+#     python dashboard.py                 (auto-detect the ST-LINK port)
+#     python dashboard.py --demo          (simulator, no board needed)
