@@ -5,6 +5,7 @@
 | `main.c` | STM32F401RE firmware (CMSIS only): APFC capacitor bank + Active Harmonic Filter (TB6612FNG) |
 | `dashboard.py` | Real-time PC dashboard: shared V/I waveforms, *Power Factor Correction* and *Harmonic Mitigation* tabs |
 | `requirements.txt` | Python libraries for the dashboard and how to install them |
+| `CAPACITOR_RELAY_GUIDELINES.txt` | **Read before using the capacitor bank**: switching rules and safety |
 
 ## Run the dashboard
 
@@ -24,7 +25,8 @@ python dashboard.py --port COM6
 | `AHF_INJ_RATIO` | Coupling-transformer ratio; `1` for direct injection. |
 | `AHF_VDC`, `AHF_L_H`, `AHF_R_OHM` | Only a starting guess; the firmware measures the real values. |
 | `RELAY_SSR_MASK` | Bit set = that pin drives an active-HIGH SSR (default `0x4`: PB2). Clear = 5 V active-LOW relay module. |
-| `CAP_RECLOSE_MS` | 10 s minimum OFF time before a capacitor re-closes. |
+| `RELAY_MIN_ON_MS`, `CAP_RECLOSE_MS` | 10 s minimum ON and OFF time for each capacitor. |
+| `RELAY_SYNC`, `RELAY_T_OP_MS`, `RELAY_T_REL_MS` | Relay modules open just before and close at the voltage peak, so a capacitor without a bleeder resistor is reconnected with ~0 V across the contacts. |
 
 ## Capacitor bank safety
 
