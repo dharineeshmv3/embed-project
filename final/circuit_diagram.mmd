@@ -1,0 +1,141 @@
+---
+config:
+  layout: elk
+  elk:
+    mergeEdges: true
+    nodePlacementStrategy: BRANDES_KOEPF
+  flowchart:
+    curve: step
+    nodeSpacing: 24
+    rankSpacing: 60
+    padding: 10
+  themeVariables:
+    fontFamily: Arial
+    fontSize: 12px
+    edgeLabelBackground: "#ffffff"
+---
+flowchart LR
+
+  subgraph S1["AC Input"]
+    L["Mains L<br/>230 V 50 Hz"]
+    N["Mains N"]
+  end
+
+  subgraph S2["Sensing"]
+    CS1["ACS712-05B<br/>grid current<br/>series in L"]
+    ZMPT["ZMPT101B<br/>voltage sensor<br/>across L-N"]
+  end
+
+  subgraph S3["APFC Capacitor Bank + Load"]
+    PCC(("PCC"))
+    R1["Relay K1<br/>5 V active-LOW<br/>10 A"]
+    NTC1["NTC 10D-9<br/>recommended"]
+    C1["C1 2.5 uF<br/>400 VAC<br/>bleeder 820k 1 W"]
+    R2["Relay K2<br/>5 V active-LOW<br/>10 A"]
+    NTC2["NTC 10D-9<br/>recommended"]
+    C2["C2 10 uF<br/>400 VAC<br/>bleeder 220k 1 W"]
+    SSR["SSR K3<br/>zero-cross<br/>active-HIGH"]
+    NTC3["NTC 10D-9<br/>recommended"]
+    C3["C3 20 uF<br/>400 VAC<br/>bleeder 100k 1 W"]
+    LOAD["Load<br/>charger / laptop / fan"]
+    NB(("N"))
+  end
+
+  subgraph S4["STM32 NUCLEO-F401RE (64 MHz)"]
+    PA1["PA1 (A1)<br/>ADC1_IN1"]
+    PA0["PA0 (A0)<br/>ADC1_IN0"]
+    PB0["PB0<br/>open-drain"]
+    PB1["PB1<br/>open-drain"]
+    PB2["PB2<br/>push-pull"]
+    V5["5V"]
+    PA4["PA4 (A2)<br/>ADC1_IN4"]
+    PB6["PB6 (D10)<br/>TIM4_CH1 80 kHz"]
+    PB8["PB8 (D15)<br/>TIM4_CH3 80 kHz"]
+    V33["3V3"]
+    GND["GND"]
+    UART["PA2 / PA3<br/>USART2 (USB)"]
+  end
+
+  subgraph S5["Divider"]
+    DIV["10k series<br/>20k to GND<br/>ratio 0.667"]
+  end
+
+  subgraph S6["AHF Output"]
+    RINJ["Resistor<br/>10 W"]
+    CS2["ACS712-05B<br/>AHF current"]
+    IND["Inductor<br/>10 mH"]
+  end
+
+  subgraph S7["H-Bridge"]
+    PSU["12 V DC<br/>supply"]
+    TB["TB6612FNG<br/>VCC 3.3 V, VM 12 V<br/>STBY, PWMA = HIGH"]
+  end
+
+  PC["PC dashboard<br/>115200 baud"]
+
+  %% mains wiring
+  L === CS1
+  CS1 === PCC
+  PCC === R1
+  PCC === R2
+  PCC === SSR
+  PCC === LOAD
+  R1 === NTC1
+  R2 === NTC2
+  SSR === NTC3
+  NTC1 === C1
+  NTC2 === C2
+  NTC3 === C3
+  C1 === NB
+  C2 === NB
+  C3 === NB
+  LOAD === NB
+  N === NB
+  L === ZMPT
+  ZMPT === NB
+
+  %% AHF power path
+  PCC === RINJ
+  RINJ --- CS2
+  CS2 --- IND
+  IND ---|"AO1"| TB
+  NB ---|"AO2"| TB
+  PSU ---|"VM"| TB
+
+  %% analog signals
+  CS1 ---|"OUT"| DIV
+  DIV --- PA0
+  ZMPT ---|"OUT"| PA1
+  PA4 ---|"OUT"| CS2
+
+  %% control signals
+  PB0 ---|"IN"| R1
+  PB1 ---|"IN"| R2
+  PB2 ---|"DC+"| SSR
+  PB6 ---|"AIN1"| TB
+  PB8 ---|"AIN2"| TB
+  UART ---|"USB"| PC
+
+  %% supplies
+  ZMPT -.-|"VCC"| V5
+  CS1 -.-|"VCC"| V5
+  V5 -.-|"VCC"| R1
+  V5 -.-|"VCC"| R2
+  V5 -.-|"VCC"| CS2
+  V33 -.-|"VCC"| TB
+  GND -.-|"GND"| TB
+
+  linkStyle default stroke:#222,stroke-width:1px
+  linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 stroke:#000,stroke-width:2px
+
+  classDef default fill:#fff,stroke:#333,stroke-width:1px,color:#000
+  classDef dot fill:#000,stroke:#000,color:#fff,font-size:10px
+  class PCC,NB dot
+
+  style S1 fill:#fff,stroke:#999
+  style S2 fill:#fff,stroke:#999
+  style S3 fill:#fff,stroke:#999
+  style S4 fill:#fff,stroke:#999
+  style S5 fill:#fff,stroke:#999
+  style S6 fill:#fff,stroke:#999
+  style S7 fill:#fff,stroke:#999
